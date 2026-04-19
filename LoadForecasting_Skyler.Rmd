@@ -1,0 +1,324 @@
+---
+title: "ENV 797 - Time Series Analysis for Energy and Environment Applications | Spring 2026"
+subtitle: "Kaggle Load Forecasting Competition"
+author: "Skyler Ju, He Jiang"
+date: "Spring 2026"
+output: pdf_document
+geometry: margin=2.54cm
+editor_options: 
+  chunk_output_type: console
+---
+## Introduction
+
+This report documents our approach to forecasting daily residential electricity demand
+for July 2011, using historical hourly load, temperature, and relative humidity data
+spanning January 2005 to June 2011. The full project code and version history are
+available at:https://github.com/Campiomeee/TSA---Spring-2026---Load-Forecasting-Competition
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, tidy.opts = list(width.cutoff = 80), tidy = FALSE,
+                      message = FALSE, warning = FALSE, cache = TRUE)
+```
+
+## Packages
+
+```{r packages, cache=FALSE}
+library(readxl)
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(dplyr)
+library(Kendall)
+```
+
+
+## 1. Data Import and Processing
+
+```{r import-data}
+load_daily <- read_excel("../Competition/load.xlsx") %>%
+  filter(!is.na(date)) %>%
+  mutate(date = as.Date(date),
+         daily_load = rowMeans(across(starts_with("h")), na.rm = TRUE)) %>%
+  select(date, daily_load) %>% arrange(date)
+
+temp_daily <- read_excel("../Competition/temperature.xlsx") %>%
+  filter(!is.na(date)) %>% mutate(date = as.Date(date)) %>%
+  group_by(date) %>%
+  summarise(daily_avg_temp = mean(c_across(starts_with("t_ws")), na.rm = TRUE),
+            .groups = "drop")
+
+rh_daily <- read_excel("../Competition/relative_humidity.xlsx") %>%
+  filter(!is.na(date)) %>% mutate(date = as.Date(date)) %>%
+  group_by(date) %>%
+  summarise(daily_avg_rh = mean(c_across(starts_with("rh_ws")), na.rm = TRUE),
+            .groups = "drop")
+
+daily_data <- load_daily %>%
+  left_join(temp_daily, by = "date") %>%
+  left_join(rh_daily,  by = "date")
+
+head(daily_data)
+```
+
+## 2. Exploratory Analysis
+
+```{r plot-ts, fig.height=4}
+ts_load_msts <- msts(daily_data$daily_load,
+                     seasonal.periods = c(7, 365.25), start = c(2005, 1))
+
+autoplot(ts_load_msts) +
+  ylab("Avg Daily Load (kWh)") + xlab("Year") +
+  ggtitle("Behind-the-Meter Daily Load 2005-2011") + theme_minimal()
+```
+> The series shows a clear annual seasonal pattern with demand peaking in summer, alongside high day-to-day volatility. No strong long-term trend is visible over the six-year period.
+
+```{r acf-pacf, fig.height=3}
+par(mfrow = c(1, 2))
+Acf(ts_load_msts,  lag = 60, main = "ACF - Daily Load")
+Pacf(ts_load_msts, lag = 60, main = "PACF - Daily Load")
+par(mfrow = c(1, 1))
+```
+
+> The ACF decays slowly without returning to zero, indicating persistence in the series. The PACF drops sharply after lag 1, suggesting a short autoregressive structure once the trend is accounted for.
+
+```{r stationarity}
+print(adf.test(ts_load_msts, alternative = "stationary"))
+print(summary(MannKendall(ts_load_msts)))
+```
+> The ADF test rejects the unit root hypothesis (p < 0.01), and the Mann-Kendall test finds no significant monotonic trend, both consistent with what the plot shows.
+
+```{r decompose, fig.height=5}
+autoplot(mstl(ts_load_msts)) +
+  ggtitle("MSTL Decomposition of Daily Load") + theme_minimal()
+```
+> The annual cycle is by far the largest component, swinging roughly three times wider than the weekly pattern. The trend is nearly flat across the full period. The remainder is large and noisy, meaning the seasonal patterns alone cannot fully explain the day-to-day swings in load.
+
+## 3. Setup
+
+```{r split}
+train_data   <- daily_data %>% filter(date <= as.Date("2010-06-30"))
+valid_data   <- daily_data %>% filter(date >= as.Date("2010-07-01"),
+                                      date <= as.Date("2010-07-31"))
+actual_valid <- valid_data$daily_load
+n_valid      <- 31L
+n_fore       <- 31L
+july_dates   <- seq.Date(as.Date("2011-07-01"), as.Date("2011-07-31"), by = "day")
+hist_tail    <- tail(daily_data, 60)
+
+ts_train <- msts(train_data$daily_load,
+                 seasonal.periods = c(7, 365.25), start = c(2005, 1))
+ts_full  <- msts(daily_data$daily_load,
+                 seasonal.periods = c(7, 365.25), start = c(2005, 1))
+
+mape_fn  <- function(actual, pred) mean(abs((actual - pred) / actual)) * 100
+dir.create("../Output", showWarnings = FALSE)
+template <- read.csv("../Competition/submission_template.csv")
+save_csv <- function(fc, filename) {
+  template$load <- round(fc, 2)
+  write.csv(template, paste0("../Output/", filename),
+            row.names = FALSE, quote = FALSE)
+}
+plot_fore <- function(fc, label, color) {
+  ggplot() +
+    geom_line(data = hist_tail,
+              aes(x = date, y = daily_load, color = "Historical"), linewidth = 0.8) +
+    geom_line(data = data.frame(date = july_dates, Forecast = fc),
+              aes(x = date, y = Forecast, color = label), linewidth = 1.0) +
+    scale_color_manual(values = c("Historical" = "black", setNames(color, label))) +
+    labs(x = "Date", y = "Avg Daily Load (kWh)", color = "") +
+    theme_minimal() + theme(legend.position = "bottom")
+}
+```
+
+## 4. Model 1: STL + ETS
+
+```{r m1}
+# Validate
+m1_cv  <- stlf(ts_train, h = n_valid, method = "ets")
+fc1_cv <- as.numeric(m1_cv$mean)
+mape1  <- mape_fn(actual_valid, fc1_cv)
+cat("STL+ETS  MAPE:", round(mape1, 4), "%\n")
+
+# Full forecast
+m1_full  <- stlf(ts_full, h = n_fore, method = "ets")
+fc1_full <- as.numeric(m1_full$mean)
+print(plot_fore(fc1_full, "STL+ETS", "blue") +
+        ggtitle("Model 1 STL+ETS - Forecast July 2011"))
+
+# Export
+save_csv(fc1_full, "submission_M1_STLF.csv")
+```
+
+> STL decomposes the series into trend, weekly, and annual seasonal components using locally weighted regression. ETS then fits an exponential smoothing model to the seasonally adjusted remainder.
+
+> STL+ETS achieved a validation MAPE of 14.49% and a Kaggle score of 0.1330. The model captures the general seasonal shape but tends to smooth over short-term variation, leading to larger errors on peak and trough days.
+
+## 5. Model 2: TBATS
+
+TBATS handles multiple seasonal periods via trigonometric seasonality, Box-Cox
+transformation, and ARMA errors, without requiring manual specification of Fourier terms.
+
+```{r m2}
+# Validate
+m2_cv  <- tbats(ts_train)
+fc2_cv <- as.numeric(forecast(m2_cv, h = n_valid)$mean)
+mape2  <- mape_fn(actual_valid, fc2_cv)
+cat("TBATS  MAPE:", round(mape2, 4), "%\n")
+
+# Full forecast
+m2_full  <- tbats(ts_full)
+fc2_full <- as.numeric(forecast(m2_full, h = n_fore)$mean)
+print(plot_fore(fc2_full, "TBATS", "darkgreen") +
+        ggtitle("Model 2 TBATS - Forecast July 2011"))
+
+# Export
+save_csv(fc2_full, "submission_M2_TBATS.csv")
+```
+
+> TBATS models multiple seasonal periods directly using trigonometric terms. TBATS achieved a validation MAPE of 11.34% and the best Kaggle score of 0.0998, beating the baseline. Its direct handling of both weekly and annual trigonometric seasonality made it the strongest single model on the true July 2011 data.
+
+
+## 6. Model 3: Fourier + ARIMA
+
+```{r m3}
+K <- c(3, 5)
+
+# Validate
+m3_cv  <- auto.arima(ts_train, xreg = fourier(ts_train, K = K),seasonal = FALSE, stepwise = TRUE, approximation = FALSE)
+fc3_cv <- as.numeric(forecast(m3_cv, xreg = fourier(ts_train, K = K, h = n_valid))$mean)
+mape3  <- mape_fn(actual_valid, fc3_cv)
+cat("Fourier+ARIMA  MAPE:", round(mape3, 4), "%\n")
+print(m3_cv)
+
+# Full forecast
+m3_full  <- auto.arima(ts_full, xreg = fourier(ts_full, K = K),
+                       seasonal = FALSE, stepwise = TRUE, approximation = FALSE)
+fc3_full <- as.numeric(forecast(m3_full,xreg = fourier(ts_full, K = K, h = n_fore))$mean)
+print(plot_fore(fc3_full, "Fourier+ARIMA", "red") +
+ggtitle("Model 3 Fourier+ARIMA - Forecast July 2011"))
+
+# Export
+save_csv(fc3_full, "submission_M3_FourierARIMA.csv")
+```
+
+---
+
+## 7. Model 4: NNETAR
+
+```{r m4}
+set.seed(42)
+
+# Validate
+m4_cv  <- nnetar(ts_train, p = 7, P = 1, repeats = 30)
+fc4_cv <- as.numeric(forecast(m4_cv, h = n_valid, PI = FALSE)$mean)
+mape4  <- mape_fn(actual_valid, fc4_cv)
+cat("NNETAR  MAPE:", round(mape4, 4), "%\n")
+print(m4_cv)
+
+# Full forecast
+m4_full  <- nnetar(ts_full, p = 7, P = 1, repeats = 30)
+fc4_full <- as.numeric(forecast(m4_full, h = n_fore, PI = FALSE)$mean)
+print(plot_fore(fc4_full, "NNETAR", "purple") +
+        ggtitle("Model 4 NNETAR - Forecast July 2011"))
+
+# Export
+save_csv(fc4_full, "submission_M4_NNETAR.csv")
+```
+
+> NNETAR fits a feed-forward neural network on lagged values of the series. We use p = 7 (past 7 days) as AR lags and P = 1 (same day last week) as the seasonal lag, averaged over 30 independently trained networks to reduce. variance.
+
+> It had the weakest performance (validation MAPE 15.26% and Kaggle score 0.1495), likely because non-linear relationships are harder to learn reliably from limited seasonal examples.
+
+
+## 8. Model 5: Fourier + ARIMA + Temperature
+
+
+```{r m5}
+# Validate
+m5_cv  <- auto.arima(ts_train,
+                     xreg = cbind(fourier(ts_train, K = K),
+                                  Temp = train_data$daily_avg_temp),
+                     seasonal = FALSE, stepwise = TRUE, approximation = TRUE)
+fc5_cv <- as.numeric(forecast(m5_cv,
+                               xreg = cbind(fourier(ts_train, K = K, h = n_valid),
+                                            Temp = valid_data$daily_avg_temp))$mean)
+mape5  <- mape_fn(actual_valid, fc5_cv)
+cat("Fourier+ARIMA+Temp  MAPE:", round(mape5, 4), "%\n")
+print(m5_cv)
+
+# Full forecast (July 2010 temp as proxy)
+temp_july2010 <- daily_data %>%
+  filter(date >= as.Date("2010-07-01"), date <= as.Date("2010-07-31")) %>%
+  pull(daily_avg_temp)
+
+m5_full  <- auto.arima(ts_full,
+                       xreg = cbind(fourier(ts_full, K = K),
+                                    Temp = daily_data$daily_avg_temp),
+                       seasonal = FALSE, stepwise = TRUE, approximation = TRUE)
+fc5_full <- as.numeric(forecast(m5_full,
+                                 xreg = cbind(fourier(ts_full, K = K, h = n_fore),
+                                              Temp = temp_july2010))$mean)
+print(plot_fore(fc5_full, "FA+Temp", "orange") +
+        ggtitle("Model 5 Fourier+ARIMA+Temp - Forecast July 2011"))
+
+# Export
+save_csv(fc5_full, "submission_M5_FA_Temp.csv")
+```
+> This model extends Model 3 by adding daily average temperature as an external regressor. Since July 2011 temperatures are unavailable, July 2010 observed daily temperatures are used as a proxy.
+
+> Adding temperature selected an ARIMA(2,1,1) error structure and reduced sigma-squared from 179,958 to 131,178, confirming temperature explains additional variance in training. However, validation MAPE (13.69%) and Kaggle score (0.1292) were both worse than Model 3, suggesting the proxy temperature introduced more error than the variable added value.
+
+## 9. Model Comparison and Ensemble
+
+```{r comparison}
+mapes  <- c(mape1, mape2, mape3, mape4, mape5)
+scores <- data.frame(
+  Model = c("M1 STL+ETS", "M2 TBATS", "M3 Fourier+ARIMA", "M4 NNETAR", "M5 FA+Temp"),
+  MAPE  = round(mapes, 4)
+)
+print(scores[order(scores$MAPE), ])
+```
+
+> On the July 2010 validation set, Fourier+ARIMA achieved the lowest MAPE at 10.96%, followed by TBATS at 11.34%. On the actual July 2011 Kaggle leaderboard, TBATS scored best at 0.0998 and Fourier+ARIMA at 0.1026 -- a slight reversal, highlighting that a single holdout month is not always a perfect proxy for future accuracy.
+
+```{r cv-plot, fig.height=4}
+cv_df <- data.frame(date = valid_data$date, Actual = actual_valid,
+                    STL_ETS = fc1_cv, TBATS = fc2_cv, Fourier_ARIMA = fc3_cv,
+                    NNETAR  = fc4_cv, FA_Temp = fc5_cv)
+
+ggplot(cv_df, aes(x = date)) +
+  geom_line(aes(y = Actual,        color = "Actual"),        linewidth = 1.1) +
+  geom_line(aes(y = STL_ETS,       color = "STL+ETS"),       linetype = "dashed") +
+  geom_line(aes(y = TBATS,         color = "TBATS"),         linetype = "dashed") +
+  geom_line(aes(y = Fourier_ARIMA, color = "Fourier+ARIMA"), linetype = "dashed") +
+  geom_line(aes(y = NNETAR,        color = "NNETAR"),        linetype = "dotted") +
+  geom_line(aes(y = FA_Temp,       color = "FA+Temp"),       linetype = "dotdash") +
+  scale_color_manual(
+    values = c("Actual" = "black", "STL+ETS" = "blue", "TBATS" = "darkgreen",
+               "Fourier+ARIMA" = "red", "NNETAR" = "purple", "FA+Temp" = "orange")) +
+  labs(title = "All Models - Validation (July 2010)",
+       x = "Date", y = "Avg Daily Load (kWh)", color = "Model") +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+> Fourier+ARIMA and TBATS track the actual July 2010 demand most closely. STL+ETS and NNETAR produce flatter forecasts and miss peak days, which explains their higher MAPE.
+
+```{r ensemble}
+weights     <- (1 / mapes) / sum(1 / mapes)
+fc_ensemble <- weights[1]*fc1_full + weights[2]*fc2_full + weights[3]*fc3_full +
+               weights[4]*fc4_full + weights[5]*fc5_full
+
+print(data.frame(Model  = scores$Model, Weight = round(weights, 4)))
+
+print(plot_fore(fc_ensemble, "Ensemble", "red") +
+        ggtitle("Ensemble Forecast - July 2011"))
+
+save_csv(fc_ensemble, "Model_PerformanceWeighted.csv")
+```
+> The final forecast here is a performance-Weighted Average** of all five models. Each model's weight is the inverse of its validation MAPE, normalized to sum to 1. Fourier+ARIMA receives the highest weight (0.2358) and NNETAR the lowest (0.1693). The ensemble scored 0.1146 on Kaggle, worse than TBATS and Fourier+ARIMA individually, because the three weaker models pulled the combined forecast away from the better performing pair.
+
+## Conclusions
+We fitted five time series models to forecast daily residential electricity demand for July 2011. Fourier+ARIMA and TBATS consistently outperformed the other three, with validation MAPEs of 10.96% and 11.34% respectively, both relying on trigonometric terms to capture the dominant weekly and annual seasonal cycles. On the true July 2011 data, TBATS achieved the best Kaggle score of 0.0998, narrowly ahead of Fourier+ARIMA at 0.1026, beating the baseline model. Adding temperature as a regressor did not improve accuracy, as proxy temperatures from the prior year introduced more error than the variable contributed. The performance-weighted ensemble scored 0.1146, worse than either top model individually, because weight assigned to the three weaker models diluted the forecast. 
+  
+## AI Tool Disclosure
+Claude was used to assist with debugging and report grammar check in this project. 
