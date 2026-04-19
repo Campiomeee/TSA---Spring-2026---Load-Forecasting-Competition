@@ -155,9 +155,6 @@ save_csv(fc1_full, "submission_M1_STLF.csv")
 
 ## 5. Model 2: TBATS
 
-TBATS handles multiple seasonal periods via trigonometric seasonality, Box-Cox
-transformation, and ARMA errors, without requiring manual specification of Fourier terms.
-
 ```{r m2}
 # Validate
 m2_cv  <- tbats(ts_train)
