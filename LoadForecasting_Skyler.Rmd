@@ -10,10 +10,7 @@ editor_options:
 ---
 ## Introduction
 
-This report documents our approach to forecasting daily residential electricity demand
-for July 2011, using historical hourly load, temperature, and relative humidity data
-spanning January 2005 to June 2011. The full project code and version history are
-available at:https://github.com/Campiomeee/TSA---Spring-2026---Load-Forecasting-Competition
+This report documents our approach to forecasting daily residential electricity demand for July 2011, using historical hourly load, temperature, and relative humidity data spanning January 2005 to June 2011. The full project code and version history are available at:https://github.com/Campiomeee/TSA---Spring-2026---Load-Forecasting-Competition
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, tidy.opts = list(width.cutoff = 80), tidy = FALSE,
@@ -130,6 +127,7 @@ plot_fore <- function(fc, label, color) {
 }
 ```
 
+
 ## 4. Model 1: STL + ETS
 
 ```{r m1}
@@ -146,7 +144,7 @@ print(plot_fore(fc1_full, "STL+ETS", "blue") +
         ggtitle("Model 1 STL+ETS - Forecast July 2011"))
 
 # Export
-save_csv(fc1_full, "submission_M1_STLF.csv")
+save_csv(fc1_full, "Model_STL+ETS.csv")
 ```
 
 > STL decomposes the series into trend, weekly, and annual seasonal components using locally weighted regression. ETS then fits an exponential smoothing model to the seasonally adjusted remainder.
@@ -169,7 +167,7 @@ print(plot_fore(fc2_full, "TBATS", "darkgreen") +
         ggtitle("Model 2 TBATS - Forecast July 2011"))
 
 # Export
-save_csv(fc2_full, "submission_M2_TBATS.csv")
+save_csv(fc2_full, "Model_TBATS.csv")
 ```
 
 > TBATS models multiple seasonal periods directly using trigonometric terms. TBATS achieved a validation MAPE of 11.34% and the best Kaggle score of 0.0998, beating the baseline. Its direct handling of both weekly and annual trigonometric seasonality made it the strongest single model on the true July 2011 data.
@@ -185,7 +183,6 @@ m3_cv  <- auto.arima(ts_train, xreg = fourier(ts_train, K = K),seasonal = FALSE,
 fc3_cv <- as.numeric(forecast(m3_cv, xreg = fourier(ts_train, K = K, h = n_valid))$mean)
 mape3  <- mape_fn(actual_valid, fc3_cv)
 cat("Fourier+ARIMA  MAPE:", round(mape3, 4), "%\n")
-print(m3_cv)
 
 # Full forecast
 m3_full  <- auto.arima(ts_full, xreg = fourier(ts_full, K = K),
@@ -195,8 +192,10 @@ print(plot_fore(fc3_full, "Fourier+ARIMA", "red") +
 ggtitle("Model 3 Fourier+ARIMA - Forecast July 2011"))
 
 # Export
-save_csv(fc3_full, "submission_M3_FourierARIMA.csv")
+save_csv(fc3_full, "Model_Fourier+ARIMA.csv")
 ```
+
+> Fourier+ARIMA had the lowest validation MAPE at 10.96% and selected an ARIMA(0,1,5) error structure. Its Kaggle score of 0.1026 was close to TBATS, confirming that both models capture the key seasonal structure effectively.
 
 ---
 
@@ -210,7 +209,6 @@ m4_cv  <- nnetar(ts_train, p = 7, P = 1, repeats = 30)
 fc4_cv <- as.numeric(forecast(m4_cv, h = n_valid, PI = FALSE)$mean)
 mape4  <- mape_fn(actual_valid, fc4_cv)
 cat("NNETAR  MAPE:", round(mape4, 4), "%\n")
-print(m4_cv)
 
 # Full forecast
 m4_full  <- nnetar(ts_full, p = 7, P = 1, repeats = 30)
@@ -219,10 +217,10 @@ print(plot_fore(fc4_full, "NNETAR", "purple") +
         ggtitle("Model 4 NNETAR - Forecast July 2011"))
 
 # Export
-save_csv(fc4_full, "submission_M4_NNETAR.csv")
+save_csv(fc4_full, "Model_NNETAR.csv")
 ```
 
-> NNETAR fits a feed-forward neural network on lagged values of the series. We use p = 7 (past 7 days) as AR lags and P = 1 (same day last week) as the seasonal lag, averaged over 30 independently trained networks to reduce. variance.
+> NNETAR fits a feed-forward neural network on lagged values of the series. We use p = 7 (past 7 days) as AR lags and P = 1 (same day last week) as the seasonal lag, averaged over 30 independently trained networks to reduce variance.
 
 > It had the weakest performance (validation MAPE 15.26% and Kaggle score 0.1495), likely because non-linear relationships are harder to learn reliably from limited seasonal examples.
 
@@ -259,7 +257,7 @@ print(plot_fore(fc5_full, "FA+Temp", "orange") +
         ggtitle("Model 5 Fourier+ARIMA+Temp - Forecast July 2011"))
 
 # Export
-save_csv(fc5_full, "submission_M5_FA_Temp.csv")
+save_csv(fc5_full, "Model_Fourier+ARIMA+Temp.csv")
 ```
 > This model extends Model 3 by adding daily average temperature as an external regressor. Since July 2011 temperatures are unavailable, July 2010 observed daily temperatures are used as a proxy.
 
@@ -307,15 +305,16 @@ fc_ensemble <- weights[1]*fc1_full + weights[2]*fc2_full + weights[3]*fc3_full +
 
 print(data.frame(Model  = scores$Model, Weight = round(weights, 4)))
 
-print(plot_fore(fc_ensemble, "Ensemble", "red") +
-        ggtitle("Ensemble Forecast - July 2011"))
+print(plot_fore(fc_ensemble, "PerformanceWeighted", "red") +
+        ggtitle("PerformanceWeighted Forecast - July 2011"))
 
 save_csv(fc_ensemble, "Model_PerformanceWeighted.csv")
 ```
-> The final forecast here is a performance-Weighted Average** of all five models. Each model's weight is the inverse of its validation MAPE, normalized to sum to 1. Fourier+ARIMA receives the highest weight (0.2358) and NNETAR the lowest (0.1693). The ensemble scored 0.1146 on Kaggle, worse than TBATS and Fourier+ARIMA individually, because the three weaker models pulled the combined forecast away from the better performing pair.
+> We also tried a performance-weighted average of all five models (it's not a model itself). Each model's weight is the inverse of its validation MAPE, normalized to sum to 1. Fourier+ARIMA receives the highest weight (0.2358) and NNETAR the lowest (0.1693). The ensemble scored 0.1146 on Kaggle, worse than TBATS and Fourier+ARIMA individually, because the three weaker models pulled the combined forecast away from the better performing pair.
 
 ## Conclusions
-We fitted five time series models to forecast daily residential electricity demand for July 2011. Fourier+ARIMA and TBATS consistently outperformed the other three, with validation MAPEs of 10.96% and 11.34% respectively, both relying on trigonometric terms to capture the dominant weekly and annual seasonal cycles. On the true July 2011 data, TBATS achieved the best Kaggle score of 0.0998, narrowly ahead of Fourier+ARIMA at 0.1026, beating the baseline model. Adding temperature as a regressor did not improve accuracy, as proxy temperatures from the prior year introduced more error than the variable contributed. The performance-weighted ensemble scored 0.1146, worse than either top model individually, because weight assigned to the three weaker models diluted the forecast. 
+We fitted five time series models to forecast daily residential electricity demand for July 2011. Fourier+ARIMA and TBATS consistently outperformed the other three, with validation MAPEs of 10.96% and 11.34% respectively, both relying on trigonometric terms to capture the dominant weekly and annual seasonal cycles. On the true July 2011 data, TBATS achieved the best Kaggle score of 0.0998, narrowly ahead of Fourier+ARIMA at 0.1026, beating the baseline model. Adding temperature as a regressor did not improve accuracy, as proxy temperatures from the prior year introduced more error than the variable contributed. The performance-weighted ensemble scored 0.1146, worse than either top model individually, because weight assigned to the three weaker models 
+reduced the overall accuracy. 
   
 ## AI Tool Disclosure
 Claude was used to assist with debugging and report grammar check in this project. 
